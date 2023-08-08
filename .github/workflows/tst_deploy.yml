@@ -1,0 +1,79 @@
+name: CI ~ Deploy App to Testing
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+
+jobs:
+  build:
+    name: Deploy in EC2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16.18.0
+
+      - name: Make envfile
+        uses: SpicyPizza/create-envfile@v1.3
+        with:
+          envkey_APP_HOST: ${{ secrets.TST_APP_HOST }}
+          envkey_FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Running Prettier and Eslint
+        run: npm run format:check && npm run lint
+
+      - name: Build client
+        run: npm run webpack:prod
+
+      - name: Build server
+        run: npm run server:prod
+
+      - name: Get Github action IP
+        id: ip
+        uses: haythem/public-ip@v1.2
+
+      - name: Setting environment variables..
+        run: |
+          echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
+          echo "AWS_SG_NAME=launch-wizard-1" >> $GITHUB_ENV
+
+      - name: Add Github Actions IP to Security group
+        run: |
+          aws ec2 authorize-security-group-ingress --group-name ${{ env.AWS_SG_NAME }} --protocol tcp --port 22 --cidr ${{ steps.ip.outputs.ipv4 }}/32
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Execute deploy script
+        env:
+          PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY  }}
+          HOSTNAME: ${{ secrets.HOSTNAME  }}
+          USER_NAME: ${{ secrets.USER  }}
+        run: |
+          echo "$PRIVATE_KEY" > private_key && chmod 600 private_key
+          rsync -avz -e 'ssh -o StrictHostKeyChecking=no -i private_key' ./dist ./build ./public ./package-lock.json ./package.json ${USER_NAME}@${HOSTNAME}:./cinema-staging
+          ssh -o StrictHostKeyChecking=no -i private_key ${USER_NAME}@${HOSTNAME} '
+            cd cinema-staging
+            pm2 stop staging-app
+
+            rm -rf node_modules
+            npm i
+
+            pm2 reload staging-app
+          '
+
+      - name: Remove Github Actions IP from security group
+        run: |
+          aws ec2 revoke-security-group-ingress --group-name ${{ env.AWS_SG_NAME }} --protocol tcp --port 22 --cidr ${{ steps.ip.outputs.ipv4 }}/32
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        if: always()
